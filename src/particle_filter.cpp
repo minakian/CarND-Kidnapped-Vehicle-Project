@@ -24,9 +24,10 @@ void ParticleFilter::init(double x, double y, double theta, double std[]) {
 	//   x, y, theta and their uncertainties from GPS) and all weights to 1.
 	// Add random Gaussian noise to each particle.
 	// NOTE: Consult particle_filter.h for more information about this method (and others in this file).
-  num_particles = 100;
+  num_particles = 10;
 
   particles.resize(num_particles);
+  weights.resize(num_particles, 1.);
   std::default_random_engine generator;
   std::normal_distribution<double> distribution(0,1);
 
@@ -64,14 +65,6 @@ void ParticleFilter::prediction(double delta_t, double std_pos[], double velocit
     x_f = particle.x + (velocity/yaw_rate)*(sin(theta_f) - sin(particle.theta));
     y_f = particle.y + (velocity/yaw_rate)*(cos(particle.theta) - cos(theta_f));
 
-//    std::normal_distribution<double> distribution_x(x_f,std_pos[0]);
-//    std::normal_distribution<double> distribution_y(y_f,std_pos[1]);
-//    std::normal_distribution<double> distribution_theta(theta_f,std_pos[2]);
-
-//    particle.x = distribution_x(generator);
-//    particle.y = distribution_y(generator);
-//    particle.theta = distribution_theta(generator);
-
     particle.x = x_f + std_pos[0] * distribution(generator);
     particle.y = y_f + std_pos[1] * distribution(generator);
     particle.theta = theta_f + std_pos[2] * distribution(generator);
@@ -84,12 +77,19 @@ void ParticleFilter::dataAssociation(std::vector<LandmarkObs> predicted, std::ve
 	//   observed measurement to this particular landmark.
 	// NOTE: this method will NOT be called by the grading code. But you will probably find it useful to
 	//   implement this method and use it as a helper during the updateWeights phase.
+  for(auto & obs: observations){
+    double closest = 500;
+    for(int i = 0; i < predicted.size(); i++){
+      double dist_ = dist(obs.x, obs.y, predicted[i].x, predicted[i].y);
+      if(dist_ < closest){
+        closest = dist_;
+        obs.id = i;
 
+      }
+    }
+  }
 }
 
-inline double bivariate_normal(double x, double y, double mu_x, double mu_y, double sig_x, double sig_y){
-  return exp(-((x-mu_x)*(x-mu_x)/(2.*sig_x*sig_x)+(y-mu_y)*(y-mu_y)/(2.*sig_y*sig_y)))/(2.*M_PI*sig_x*sig_y);
-}
 
 void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 		std::vector<LandmarkObs> observations, Map map_landmarks) {
@@ -104,92 +104,58 @@ void ParticleFilter::updateWeights(double sensor_range, double std_landmark[],
 	//   3.33
 	//   http://planning.cs.uiuc.edu/node99.html
 
-  for(int p = 0; p < num_particles; p++){  // update weight for every particle
+  std::vector<LandmarkObs> predicted(observations.size());
+  std::vector<LandmarkObs> landmarks(observations.size());
 
-    Particle &particle = particles[p];
 
-    // convert observations into map coordinate system
-    // rotation + translation
+  for (auto & part : particles) {
+    // Observations relative to particle
+    for (int i = 0; i < observations.size(); ++i) {
+      const auto & obs = observations[i];
+      predicted[i].x = part.x + observations[i].x * cos(part.theta) - observations[i].y * sin(part.theta);
+      predicted[i].y = part.y + observations[i].x * sin(part.theta) + observations[i].y * cos(part.theta);
+    }
 
-    std::vector<LandmarkObs> observation_in_map_coord;
-
-    for(int j = 0; j < observations.size(); j++){
-
-      LandmarkObs observation = observations[j];
-
-      // if the observations are in sensor range convert to map coordinate system
-      if(dist(observations[j].x,observations[j].y,0,0)<=sensor_range){
-
-        LandmarkObs observation_in_map;
-        double theta = -particle.theta;
-        observation_in_map.x =   observation.x * cos(theta) + observation.y * sin(theta);
-        observation_in_map.y = - observation.x * sin(theta) + observation.y * cos(theta);
-
-        observation_in_map.x += particle.x;
-        observation_in_map.y += particle.y;
-
-        observation_in_map_coord.push_back(observation_in_map);
-
+    // Filter landmarks inside the sensor range
+    landmarks.clear(); // error if not cleared
+    for (const auto & landmark : map_landmarks.landmark_list) {
+      if (dist(landmark.x_f, landmark.y_f, part.x, part.y) <= sensor_range) {
+        landmarks.push_back({landmark.id_i, (double)landmark.x_f, (double)landmark.y_f});
       }
-
     }
 
-    std::vector<LandmarkObs> map_landmarks_observation; // convert Map map_landmarks to LandMarkObs object
-
-    for(int i=0;i<map_landmarks.landmark_list.size();i++){
-      LandmarkObs map_observation;
-      map_observation.x = map_landmarks.landmark_list[i].x_f;
-      map_observation.y = map_landmarks.landmark_list[i].y_f;
-      map_observation.id = map_landmarks.landmark_list[i].id_i;
-      map_landmarks_observation.push_back(map_observation);
-    }
-
-
-    // calculate the weight for this particle
-    double wg = 1.;
-    for(int i=0;i<observation_in_map_coord.size();i++){
-      // for each observations, find the closest landmark
-
-      double min_dist = 1e100;
-      int min_index = -1;
-
-      for(int j=0;j<map_landmarks_observation.size();j++){
-
-        double dst = dist(observation_in_map_coord[i].x,observation_in_map_coord[i].y,map_landmarks_observation[j].x,map_landmarks_observation[j].y);
-        if(dst < min_dist){
-          min_dist = dst;
-          min_index = j;
-        }
+    if (!landmarks.empty()) {
+      // Associate landmarks with observations
+      dataAssociation(predicted, landmarks);
+      // Update the weight of this particle
+      double weight = 1.0;
+      for(const auto & landmark : landmarks) {
+        // map landmark to observation x, y
+        double x = predicted[landmark.id].x;
+        double y = predicted[landmark.id].y;
+        // update weight with the bivariate gaussian probability.
+        double temp_x = (x - landmark.x) / std_landmark[0];
+        double temp_y = (y - landmark.y) / std_landmark[1];
+        weight *= 0.5 * M_1_PI * exp(-0.5 * ((temp_x*temp_x) + (temp_y*temp_y)) / (std_landmark[0] * std_landmark[1]));
       }
-
-      // calculate the weight from this observations and its losest landmark.
-      wg *= bivariate_normal(observation_in_map_coord[i].x,
-                             observation_in_map_coord[i].y,
-                             map_landmarks_observation[min_index].x,
-                             map_landmarks_observation[min_index].y,
-                             std_landmark[0],std_landmark[1]);
-
+      // Update weight
+      part.weight = weight;
+    } else {
+      // Case where there are no landmarks in range... Ignore all observations.
+      part.weight = 0.0;
     }
-
-    particle.weight = wg;
-  } // end loop for particles
-
-
-  // normalize weights
-  double wg_sum = 0.;
-  for(int i=0;i<particles.size();i++)
-    wg_sum += particles[i].weight;
-
-  for(int i=0;i<particles.size();i++)
-    particles[i].weight /= wg_sum;
-
+  }
+  // Copy all the particle weights. It's better to iterate again on
+  // all particles than to mess the previous loop.
+  for(int i = 0; i < particles.size(); i++)
+    weights[i] = particles[i].weight;
 }
+
 
 void ParticleFilter::resample() {
 	// TODO: Resample particles with replacement with probability proportional to their weight.
 	// NOTE: You may find std::discrete_distribution helpful here.
 	//   http://en.cppreference.com/w/cpp/numeric/random/discrete_distribution
-
   std::default_random_engine generator;
 
   std::vector<double> weights(num_particles);
